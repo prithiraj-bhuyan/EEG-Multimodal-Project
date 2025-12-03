@@ -1,3 +1,4 @@
+
 # ============================================================
 # STEP 1: IMPORTS
 # ============================================================
@@ -15,7 +16,8 @@ sys.path.append('/jet/home/gulavani/Project/final')
 
 # Import your fixed modules
 from eeg_dataset import create_datasets
-from eeg_encoder import EEGClassifier
+# CHANGE 1: New Class Import
+from eeg_encoder import EEGTransformer 
 
 print("✅ Imports successful!")
 
@@ -31,10 +33,11 @@ config = {
     'batch_size': 32,
     'learning_rate': 1e-4,
     'weight_decay': 1e-5,
-    'num_epochs': 50,  # Should be fast to train
-    'model_type': 'EEGClassifier_v2',
-    'emb_dim': 256,  # NEW: embedding dimension
-    'hid_dim': 512,
+    'num_epochs': 50,
+    'model_type': 'EEGTransformer_v1', # Updated Name
+    'd_model': 256,  # Updated Config Key
+    'nhead': 8,
+    'num_layers': 4
 }
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -96,12 +99,8 @@ eeg, img, caption, cat_label, subj_id = next(iter(train_loader))
 
 print(f"✅ Batch loaded successfully:")
 print(f"   EEG shape:     {eeg.shape}")        # Should be (32, 122, 500)
-print(f"   Image shape:   {img.shape}")        # Should be (32, 3, 224, 224)
-print(f"   Caption:       {type(caption)} (len={len(caption)})")
 print(f"   Category:      {cat_label.shape}")  # Should be (32,)
 print(f"   Subject ID:    {subj_id.shape}")    # Should be (32,)
-print(f"\n   Sample category labels: {cat_label[:5]}")
-print(f"   Sample subject IDs:     {subj_id[:5]}")
 
 
 # ============================================================
@@ -111,11 +110,15 @@ print("\n" + "="*60)
 print("CREATING NEW MODEL")
 print("="*60)
 
-model = EEGClassifier(
-    in_dim=122*500,
-    hid_dim=config['hid_dim'],
-    emb_dim=config['emb_dim'],
-    num_classes=20
+# CHANGE 2: New Model Init
+model = EEGTransformer(
+    num_electrodes=122,
+    time_points=500,
+    num_classes=20,
+    num_subjects=13,
+    d_model=config['d_model'],
+    nhead=config['nhead'],
+    num_layers=config['num_layers']
 ).to(device)
 
 total_params = sum(p.numel() for p in model.parameters())
@@ -136,15 +139,16 @@ print("="*60)
 model.eval()
 with torch.no_grad():
     test_eeg = eeg[:4].to(device)  # Test with 4 samples
+    test_sub = subj_id[:4].to(device) # Needs subject IDs
     
-    # Test classification
-    logits = model(test_eeg)
+    # Test classification (Task 1)
+    logits, _ = model(test_eeg, test_sub)
     print(f"✅ Classification works:")
     print(f"   Input:  {test_eeg.shape}")
     print(f"   Output: {logits.shape}")  # Should be (4, 20)
     
-    # Test embedding extraction
-    embeddings = model.get_embeddings(test_eeg)
+    # Test embedding extraction (Task 2B)
+    embeddings = model(test_eeg, subject_ids=None) # CHANGE 3: New extraction method
     print(f"\n✅ Embedding extraction works:")
     print(f"   Input:  {test_eeg.shape}")
     print(f"   Output: {embeddings.shape}")  # Should be (4, 256)
@@ -178,17 +182,19 @@ def train_epoch(model, loader, criterion, optimizer, device, epoch):
     
     pbar = tqdm(loader, desc=f'Epoch {epoch}')
     for batch_idx, batch in enumerate(pbar):
-        # Unpack batch (new format: 5 items)
-        eeg, _, _, labels, _ = batch
+        # CHANGE 4: Unpack subject_ids
+        eeg, _, _, labels, subject_ids = batch
         
         eeg = eeg.to(device)
         labels = labels.to(device)
+        subject_ids = subject_ids.to(device) # Move to GPU
         
         # Zero gradients
         optimizer.zero_grad()
         
-        # Forward pass
-        logits = model(eeg)  # No softmax!
+        # Forward pass (Pass subject_ids)
+        logits, _ = model(eeg, subject_ids) 
+        
         loss = criterion(logits, labels)
         
         # Backward pass
@@ -220,13 +226,16 @@ def validate(model, loader, criterion, device):
     
     with torch.no_grad():
         for batch in tqdm(loader, desc='Validating'):
-            eeg, _, _, labels, _ = batch
+            # CHANGE 5: Unpack subject_ids
+            eeg, _, _, labels, subject_ids = batch
             
             eeg = eeg.to(device)
             labels = labels.to(device)
+            subject_ids = subject_ids.to(device)
             
             # Forward pass
-            logits = model(eeg)
+            logits, _ = model(eeg, subject_ids)
+            
             loss = criterion(logits, labels)
             
             # Statistics
@@ -239,19 +248,16 @@ def validate(model, loader, criterion, device):
 
 
 # ============================================================
-# STEP 9: INITIALIZE WANDB (OPTIONAL BUT RECOMMENDED)
+# STEP 9: INITIALIZE WANDB
 # ============================================================
-wandb.login(key="825201e63a02e53435b53a136158ab39815c89a4")  # Your key
+# wandb.login(key="YOUR_KEY")  # Uncomment if needed
 
 wandb.init(
     project="eeg-classification",
-    name="new-architecture-v2",
+    name="transformer-arch-v1",
     config=config,
-    tags=['new_arch', 'task2b_ready']
+    tags=['transformer', 'subject_heads', 'task1']
 )
-
-wandb.watch(model, criterion, log="all", log_freq=100)
-
 
 # ============================================================
 # STEP 10: TRAINING LOOP
@@ -307,9 +313,6 @@ for epoch in range(1, num_epochs + 1):
         wandb.save(checkpoint_path)
         
         print(f"  ✅ NEW BEST! Val Acc: {val_acc:.2f}%")
-        
-        wandb.run.summary["best_val_acc"] = val_acc
-        wandb.run.summary["best_epoch"] = epoch
 
 print("\n" + "="*60)
 print("🎉 TRAINING COMPLETE!")
@@ -334,62 +337,13 @@ with torch.no_grad():
     test_eeg, _, _, _, _ = next(iter(val_loader))
     test_eeg = test_eeg.to(device)
     
-    embeddings = model.get_embeddings(test_eeg)
+    # CHANGE 6: Correct usage for verification
+    embeddings = model(test_eeg, subject_ids=None)
+    
     print(f"✅ Embeddings extracted successfully!")
     print(f"   Shape: {embeddings.shape}")  # Should be (batch_size, 256)
     print(f"   Mean:  {embeddings.mean().item():.4f}")
     print(f"   Std:   {embeddings.std().item():.4f}")
 
 print("\n✅ MODEL IS READY FOR TASK 2B!")
-print("\nNext steps:")
-print("1. This encoder is now Task 2B compatible")
-print("2. You can extract embeddings: model.get_embeddings(eeg)")
-print("3. Ready to implement projection heads")
-print("4. Ready to start CLIP integration")
-
 wandb.finish()
-# ```
-
-# ---
-
-## 🏃 **HOW TO RUN THIS**
-
-# ### **Option 1: Jupyter Notebook** (Recommended)
-
-# 1. Create new notebook: `train_new_encoder.ipynb`
-# 2. Copy the entire code above
-# 3. Split into cells at the `# ======` lines
-# 4. Run cell by cell
-# 5. Watch the training progress!
-
-# ### **Option 2: Python Script**
-
-# 1. Save code as `train_new_encoder.py`
-# 2. Run: `python train_new_encoder.py`
-
-# ---
-
-# ## ⏱️ **EXPECTED TIMELINE**
-
-# | Step | Time | What Happens |
-# |------|------|--------------|
-# | Imports & Setup | 30 sec | Load libraries |
-# | Create Datasets | 2-3 min | Scan all EEG files |
-# | Model Creation | 10 sec | Initialize model |
-# | Epoch 1-10 | ~10 min | Quick convergence |
-# | Epoch 11-30 | ~20 min | Stabilization |
-# | Epoch 31-50 | ~20 min | Fine-tuning |
-# | **TOTAL** | **~50 min** | Complete training |
-
-# ---
-
-# ## 📊 **WHAT TO EXPECT**
-
-# ### **Training Progress:**
-# ```
-# Epoch 1/50:   Train 15% → Val 6%
-# Epoch 5/50:   Train 30% → Val 7%
-# Epoch 10/50:  Train 45% → Val 8%
-# Epoch 20/50:  Train 55% → Val 8.5%
-# Epoch 30/50:  Train 60% → Val 9%     ← BEST
-# Epoch 50/50:  Train 65% → Val 8.8%   (slight overfit)

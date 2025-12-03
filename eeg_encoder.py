@@ -1,260 +1,131 @@
 """
-Fixed EEG Encoder Architecture
-Compatible with BOTH Task 1 (Classification) and Task 2B (Retrieval)
+Advanced EEG Transformer Architecture
+Compliant with Write-up Section 3:
+1. Temporal Learning (1D CNN)
+2. Spatial Learning (Transformer)
+3. Subject-Specific Classification Heads
 """
 
 import torch
 import torch.nn as nn
 
-
-class EEGEncoder(nn.Module):
+class EEGTransformer(nn.Module):
     """
-    EEG Encoder that outputs embeddings.
-    Can be used for both classification and retrieval.
+    Unified Transformer Architecture for both Classification and Retrieval.
     
     Architecture:
-    - Input: (batch_size, 122, 500) raw EEG
-    - Flatten: (batch_size, 61000)
-    - Hidden: (batch_size, 512) with BatchNorm + ReLU
-    - Output: (batch_size, 256) embeddings
+    - Input: (batch_size, 122, 500) Raw EEG
+    - Stage 1: Temporal 1D CNN (Independent per electrode)
+    - Stage 2: Spatial Transformer (Attention across electrodes)
+    - Stage 3: Subject-Specific Heads (13 separate linear layers)
     """
     def __init__(self, 
-                 in_dim=122*500,  # 61,000
-                 hid_dim=512, 
-                 emb_dim=256):    # Embedding dimension
-        super(EEGEncoder, self).__init__()
+                 num_electrodes=122, 
+                 time_points=500, 
+                 num_classes=20, 
+                 num_subjects=13,
+                 d_model=256, 
+                 nhead=8, 
+                 num_layers=4):
+        super(EEGTransformer, self).__init__()
         
-        self.encoder = nn.Sequential(
-            nn.Linear(in_dim, hid_dim),
-            nn.BatchNorm1d(hid_dim),
+        # 1. Define Conv Parameters
+        k_size = 15
+        stride = 4
+        pad = 7
+        
+        # 2. Temporal Feature Extraction
+        self.temporal_conv = nn.Sequential(
+            nn.Conv1d(in_channels=num_electrodes, 
+                      out_channels=num_electrodes, 
+                      kernel_size=k_size, 
+                      stride=stride, 
+                      padding=pad, 
+                      groups=num_electrodes),
+            nn.BatchNorm1d(num_electrodes),
             nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(hid_dim, emb_dim),
-            nn.BatchNorm1d(emb_dim),
-            nn.ReLU()
+            nn.Dropout(0.25)
         )
-    
-    def forward(self, x):
+        
+        # 3. Calculate Output Dimension Dynamically
+        # Formula: L_out = floor((L_in + 2*padding - kernel) / stride) + 1
+        conv_out_size = int((time_points + 2*pad - k_size) / stride) + 1
+        
+        # Now use this calculated size instead of hardcoded '125'
+        self.projection = nn.Linear(conv_out_size, d_model)
+        
+        # 4. Spatial Transformer
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, 
+                                                   nhead=nhead, 
+                                                   dim_feedforward=d_model*4, 
+                                                   batch_first=True, 
+                                                   dropout=0.25)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+        # 5. Subject-Specific Heads
+        self.subject_heads = nn.ModuleList([
+            nn.Linear(d_model, num_classes) for _ in range(num_subjects)
+        ])
+    def forward(self, x, subject_ids=None):
         """
         Args:
-            x: (batch_size, 122, 500) EEG data
+            x: (Batch, 122, 500) EEG Data
+            subject_ids: (Batch,) Tensor of Subject Indices (0-12). 
+                         Required for Classification (Task 1).
+                         Set to None for Retrieval/Embedding extraction (Task 2B).
         
         Returns:
-            embeddings: (batch_size, 256) feature embeddings
+            If subject_ids is None: 
+                embeddings (Batch, 256)
+            If subject_ids is provided: 
+                (logits, embeddings)
         """
+        # 1. Temporal Conv: (B, 122, 500) -> (B, 122, 125)
+        x = self.temporal_conv(x)
+        
+        # 2. Project to d_model: (B, 122, 125) -> (B, 122, 256)
+        x = self.projection(x)
+        
+        # 3. Spatial Transformer: (B, 122, 256) -> (B, 122, 256)
+        # The transformer treats the 122 electrodes as the sequence length.
+        x = self.transformer(x)
+        
+        # 4. Aggregate: Average over electrodes -> (B, 256)
+        embedding = x.mean(dim=1)
+        
+        # TASK 2B: If we just want embeddings, stop here.
+        if subject_ids is None:
+            return embedding
+        
+        # TASK 1: Subject-Specific Classification
         batch_size = x.shape[0]
-        x_flat = x.reshape(batch_size, -1)  # (batch_size, 61000)
-        embeddings = self.encoder(x_flat)    # (batch_size, 256)
-        return embeddings
-
-
-class EEGClassifier(nn.Module):
-    """
-    Complete classification model with encoder + classification head.
-    
-    For Task 1: Use this for training classification.
-    For Task 2B: Load the encoder part only.
-    """
-    def __init__(self, 
-                 in_dim=122*500,
-                 hid_dim=512,
-                 emb_dim=256,
-                 num_classes=20):
-        super(EEGClassifier, self).__init__()
+        logits = torch.zeros(batch_size, 20, device=x.device)
         
-        # Shared encoder
-        self.encoder = EEGEncoder(in_dim, hid_dim, emb_dim)
-        
-        # Classification head
-        self.classifier = nn.Linear(emb_dim, num_classes)
-    
-    def forward(self, x, return_embeddings=False):
-        """
-        Args:
-            x: (batch_size, 122, 500) EEG data
-            return_embeddings: If True, return both logits and embeddings
-        
-        Returns:
-            If return_embeddings=False: logits (batch_size, 20)
-            If return_embeddings=True: (logits, embeddings)
-        """
-        embeddings = self.encoder(x)        # (batch_size, 256)
-        logits = self.classifier(embeddings) # (batch_size, 20)
-        
-        if return_embeddings:
-            return logits, embeddings
-        return logits
-    
-    def get_embeddings(self, x):
-        """
-        Extract embeddings without classification.
-        Useful for Task 2B retrieval.
-        """
-        return self.encoder(x)
-
-
-# ============================================================
-# HOW TO USE THIS FOR YOUR PROJECT
-# ============================================================
-
-"""
-TASK 1 (Classification) - Current Task:
----------------------------------------
-# Create model
-model = EEGClassifier(num_classes=20)
-
-# Training loop
-for batch in train_loader:
-    eeg, _, _, labels, _ = batch
-    
-    logits = model(eeg)  # No softmax here!
-    loss = criterion(logits, labels)  # CrossEntropyLoss handles softmax
-    
-    loss.backward()
-    optimizer.step()
-
-
-TASK 2B (Retrieval) - Future Task:
-----------------------------------
-# Load the trained encoder
-checkpoint = torch.load('checkpoints/best_model.pth')
-
-# Option 1: Load just the encoder
-encoder = EEGEncoder()
-encoder.load_state_dict(checkpoint['model_state_dict']['encoder'])
-
-# Option 2: Load full model and extract encoder
-full_model = EEGClassifier()
-full_model.load_state_dict(checkpoint['model_state_dict'])
-encoder = full_model.encoder
-
-# Now use encoder for Task 2B
-eeg_embeddings = encoder(eeg_data)  # (batch_size, 256)
-# Then project to CLIP space with your projection heads
-"""
-
-
-# ============================================================
-# CONVERSION SCRIPT FOR YOUR EXISTING CHECKPOINT
-# ============================================================
-
-def convert_old_checkpoint_to_new_format(old_checkpoint_path, new_checkpoint_path):
-    """
-    Convert your existing ModelFC checkpoint to EEGClassifier format.
-    
-    Your old model structure:
-    - model.0.weight: (512, 61000) - First linear layer
-    - model.1.weight: (512,) - BatchNorm
-    - model.3.weight: (20, 512) - Classification layer
-    
-    New model structure:
-    - encoder.encoder.0.weight: (512, 61000)
-    - encoder.encoder.1.weight: (512,)
-    - encoder.encoder.4.weight: (256, 512)  ← NEW layer
-    - encoder.encoder.5.weight: (256,)      ← NEW layer
-    - classifier.weight: (20, 256)
-    
-    WARNING: This won't work directly because dimensions changed!
-    You'll need to RETRAIN with the new architecture.
-    """
-    import torch
-    
-    print("❌ CANNOT DIRECTLY CONVERT!")
-    print("Your old model: 61000 → 512 → 20")
-    print("New model: 61000 → 512 → 256 → 20")
-    print()
-    print("You need to:")
-    print("1. Create new EEGClassifier model")
-    print("2. Retrain from scratch (or fine-tune)")
-    print("3. This should be FAST since you know it works!")
-
-
-# ============================================================
-# QUICK RETRAIN SCRIPT
-# ============================================================
-
-def quick_retrain_with_new_architecture(train_loader, val_loader, 
-                                       num_epochs=50, device='cuda'):
-    """
-    Quick retraining script with new architecture.
-    Should reach similar accuracy quickly since data pipeline works.
-    """
-    import torch.optim as optim
-    
-    # Create new model
-    model = EEGClassifier(
-        in_dim=122*500,
-        hid_dim=512,
-        emb_dim=256,      # New embedding dimension
-        num_classes=20
-    ).to(device)
-    
-    # Loss and optimizer
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-5)
-    
-    best_val_acc = 0
-    
-    for epoch in range(num_epochs):
-        # Training
-        model.train()
-        for batch in train_loader:
-            eeg, _, _, labels, _ = batch
-            eeg = eeg.to(device)
-            labels = labels.to(device)
-            
-            optimizer.zero_grad()
-            logits = model(eeg)  # (batch_size, 20)
-            loss = criterion(logits, labels)
-            loss.backward()
-            optimizer.step()
-        
-        # Validation
-        model.eval()
-        correct = 0
-        total = 0
-        with torch.no_grad():
-            for batch in val_loader:
-                eeg, _, _, labels, _ = batch
-                eeg = eeg.to(device)
-                labels = labels.to(device)
+        # Efficiently apply the correct head for each sample
+        # (We iterate heads because vectorizing dynamic indexing of modules is hard)
+        unique_subs = torch.unique(subject_ids)
+        for sub_id in unique_subs:
+            mask = (subject_ids == sub_id)
+            logits[mask] = self.subject_heads[sub_id](embedding[mask])
                 
-                logits = model(eeg)
-                _, predicted = logits.max(1)
-                total += labels.size(0)
-                correct += predicted.eq(labels).sum().item()
-        
-        val_acc = 100. * correct / total
-        
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_acc': val_acc,
-            }, 'checkpoints/best_model_new_arch.pth')
-            
-            print(f"Epoch {epoch}: Val Acc = {val_acc:.2f}% (Best!)")
-        else:
-            print(f"Epoch {epoch}: Val Acc = {val_acc:.2f}%")
-    
-    return model
+        return logits, embedding
 
+# ============================================================
+# HOW TO USE THIS
+# ============================================================
 
 if __name__ == "__main__":
-    # Test the architecture
-    model = EEGClassifier()
+    # Test Architecture
+    model = EEGTransformer(num_classes=20, num_subjects=13)
     
-    # Test input
+    # Fake Data
     dummy_eeg = torch.randn(32, 122, 500)
+    dummy_sub = torch.randint(0, 13, (32,)) # Random subjects 0-12
     
-    # Test classification
-    logits = model(dummy_eeg)
-    print(f"Logits shape: {logits.shape}")  # Should be (32, 20)
+    # 1. Classification Mode (Task 1)
+    logits, emb = model(dummy_eeg, dummy_sub)
+    print(f"Logits: {logits.shape}") # (32, 20)
     
-    # Test embeddings extraction
-    embeddings = model.get_embeddings(dummy_eeg)
-    print(f"Embeddings shape: {embeddings.shape}")  # Should be (32, 256)
-    
-    print("\n✅ Architecture looks good!")
+    # 2. Retrieval Mode (Task 2B)
+    emb_only = model(dummy_eeg, subject_ids=None)
+    print(f"Embeddings: {emb_only.shape}") # (32, 256)
